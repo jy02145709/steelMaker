@@ -1,10 +1,13 @@
+from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import ezdxf
 from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi.encoders import jsonable_encoder
 
 from steelmaker import analyze_dxf
+from stock_plan import PlanRequest, plan_stock
 
 app = FastAPI(title="SteelMaker")
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
@@ -32,3 +35,11 @@ def analyze(file: UploadFile):
             return analyze_dxf(path)
         except (ezdxf.DXFError, OSError, UnicodeError) as exc:
             raise HTTPException(422, "DXF 파일을 읽을 수 없습니다.") from exc
+
+
+@app.post("/stock-plan")
+def calculate_stock(request: PlanRequest):
+    try:
+        return jsonable_encoder(plan_stock(request), custom_encoder={Decimal: str})
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc

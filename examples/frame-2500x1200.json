@@ -1,0 +1,9 @@
+{
+  "frame_quantity": 1,
+  "cuts": [
+    {"name": "외곽 가로재", "material": "50×50 각파이프", "length_mm": 2500, "pieces_per_frame": 2},
+    {"name": "외곽 세로재", "material": "50×50 각파이프", "length_mm": 1200, "pieces_per_frame": 2},
+    {"name": "중앙 세로재", "material": "50×50 각파이프", "length_mm": 1100, "pieces_per_frame": 1}
+  ],
+  "stock": {"50×50 각파이프": {"length_mm": 6000}}
+}
