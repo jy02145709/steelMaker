@@ -22,6 +22,7 @@ FIELDS = {
     "보이는면": ("visible_face_mm", rf"({NUMBER})\s*(?:mm)?", float),
     "구분": ("category", r"벨트|옆전", str),
     "수량": ("quantity", r"([0-9]+)\s*(?:ea|개)?", int),
+    "프레임당수량": ("quantity_per_frame", r"([0-9]+)\s*(?:ea|개)?", int),
 }
 
 
@@ -154,16 +155,8 @@ def member_dimensions(axis, edges, dimensions):
     return matches
 
 
-def native_length(note, face, segments, dimensions):
-    if note.dxftype() != "MTEXT":
-        return None
-    linked = leader_tip(note, segments)
-    if not linked:
-        return None
-    tip, landing, pointer = linked
-    member = member_edges(tip, face, segments)
-    if not member:
-        return None
+def native_length(note, linked, member, dimensions):
+    _, landing, pointer = linked
     axis, lower, upper = member
     # Unequal edge spans leave the cut-length reference ambiguous.
     if not all(near(a, b) for a, b in zip(lower.span(axis), upper.span(axis))):
@@ -177,6 +170,83 @@ def native_length(note, face, segments, dimensions):
     ]
 
 
+@dataclass(frozen=True)
+class Frame:
+    left: float
+    right: float
+    bottom: float
+    top: float
+    evidence: tuple
+
+    def contains(self, point):
+        return self.left <= point.x <= self.right and self.bottom <= point.y <= self.top
+
+
+def find_frames(segments, dimensions):
+    vertical = [edge for edge in segments if edge.axis() == 1]
+    horizontal = [edge for edge in segments if edge.axis() == 0]
+    candidates = {}
+    for dimension in dimensions:
+        if dimension.dimtype not in (0, 1) or dimension.dxf.text.strip() not in ("", "<>"):
+            continue
+        a, b = sorted((dimension.dxf.defpoint2, dimension.dxf.defpoint3), key=lambda p: p.x)
+        if not near(a.y, b.y) or b.x - a.x <= TOLERANCE:
+            continue
+        if not near(dimension.get_measurement(), b.x - a.x):
+            continue
+        for left in vertical:
+            if not near(left.start.x, a.x) or not near(left.span(1)[0], a.y):
+                continue
+            for right in vertical:
+                if not near(right.start.x, b.x) or not near(right.span(1)[0], b.y):
+                    continue
+                if not near(left.span(1)[1], right.span(1)[1]):
+                    continue
+                for base in horizontal:
+                    start, end = base.span(0)
+                    if near(base.start.y, a.y) and start <= a.x + TOLERANCE and end >= b.x - TOLERANCE:
+                        bounds = a.x, b.x, a.y, left.span(1)[1]
+                        candidates[bounds] = Frame(*bounds, (
+                            dimension.dxf.handle, left.handle, right.handle, base.handle,
+                        ))
+    return [
+        frame for frame in candidates.values()
+        if not any(
+            near(other.bottom, frame.bottom) and near(other.top, frame.top)
+            and other.left <= frame.left and other.right >= frame.right
+            and other.right - other.left > frame.right - frame.left + TOLERANCE
+            for other in candidates.values()
+        )
+    ]
+
+
+def frame_quantities(frames, notes):
+    matches, unassigned = {}, []
+    for note, value in notes:
+        position = note.dxf.insert
+        candidates = [
+            frame for frame in frames
+            if frame.right < position.x <= frame.right + (frame.right - frame.left)
+            and frame.bottom <= position.y <= frame.top
+        ]
+        candidates.sort(key=lambda frame: position.x - frame.right)
+        unique = candidates and (
+            len(candidates) == 1 or not near(candidates[0].right, candidates[1].right)
+        )
+        quantity = {"quantity": value, "source_handle": note.dxf.handle}
+        if unique:
+            matches.setdefault(candidates[0], []).append(quantity)
+        else:
+            unassigned.append(quantity)
+    assigned = {}
+    for frame, quantities in matches.items():
+        if len(quantities) == 1:
+            assigned[frame] = quantities[0]
+        else:
+            unassigned.extend(quantities)
+    return assigned, unassigned
+
+
 def extract_cut_list(doc):
     model = doc.modelspace()
     metric = doc.units == ezdxf.units.MM
@@ -185,18 +255,23 @@ def extract_cut_list(doc):
         for line in model.query("LINE")
     ]
     dimensions = list(model.query("DIMENSION"))
-    items, unassigned = [], []
-    for note in model.query("TEXT MTEXT"):
-        raw = note.plain_text().strip()
-        qty = re.fullmatch(r"=?\s*([1-9][0-9]*)\s*(?:ea|개)", raw, re.IGNORECASE)
+    notes = list(model.query("TEXT MTEXT"))
+    quantity_notes = []
+    for note in notes:
+        qty = re.fullmatch(r"=?\s*([1-9][0-9]*)\s*(?:ea|개)", note.plain_text().strip(), re.IGNORECASE)
         if qty:
-            unassigned.append({"quantity": int(qty[1]), "source_handle": note.dxf.handle})
-            continue
+            quantity_notes.append((note, int(qty[1])))
+    frames = find_frames(segments, dimensions) if quantity_notes else []
+    assigned, unassigned = frame_quantities(frames, quantity_notes)
+    items, occurrences, invalid_totals = [], {}, set()
+    for note in notes:
+        raw = note.plain_text().strip()
         native = PROFILE_NOTE.fullmatch(raw)
         lines = [line.strip() for line in raw.splitlines() if line.strip()]
         if not native and lines[:1] != ["절단"]:
             continue
         values = {key: UNKNOWN for key, _, _ in FIELDS.values()}
+        values["frame_quantity"] = UNKNOWN
         evidence = {}
         if native:
             values["material_spec"] = profile(native[1])
@@ -204,16 +279,63 @@ def extract_cut_list(doc):
             if metric:
                 values["visible_face_mm"] = float(native[2])
                 evidence["visible_face_mm"] = [note.dxf.handle]
-                length = native_length(note, values["visible_face_mm"], segments, dimensions)
-                if length:
-                    values["length_mm"], evidence["length_mm"] = length
         else:
-            for key, value in explicit_fields(lines[1:], metric).items():
+            fields = explicit_fields(lines[1:], metric)
+            for key, value in fields.items():
                 values[key] = value
                 if value != UNKNOWN:
                     evidence[key] = [note.dxf.handle]
-        items.append({"source_handle": note.dxf.handle, **values, "evidence": evidence})
-    return {"items": items, "unassigned_quantities": unassigned, "dxf_units": doc.units}
+        linked = leader_tip(note, segments) if note.dxftype() == "MTEXT" and (frames or (native and metric)) else None
+        if linked:
+            tip, landing, pointer = linked
+            containing = [frame for frame in frames if frame.contains(tip)]
+            frame = containing[0] if len(containing) == 1 else None
+            if frame in assigned:
+                quantity = assigned[frame]
+                values["frame_quantity"] = quantity["quantity"]
+                evidence["frame_quantity"] = [quantity["source_handle"], *frame.evidence, landing, pointer]
+            if native and metric:
+                member = member_edges(tip, values["visible_face_mm"], segments)
+                if member:
+                    _, lower, upper = member
+                    key = (lower.handle, upper.handle)
+                    occurrences.setdefault(key, []).append(len(items))
+                    length = native_length(note, linked, member, dimensions)
+                    if length:
+                        values["length_mm"], evidence["length_mm"] = length
+        item = {"source_handle": note.dxf.handle, **values, "evidence": evidence}
+        if not native and "quantity" in fields and fields["quantity"] == UNKNOWN:
+            invalid_totals.add(len(items))
+        items.append(item)
+    for edges, indexes in occurrences.items():
+        if len(indexes) != 1:
+            continue
+        item = items[indexes[0]]
+        if item["frame_quantity"] == UNKNOWN:
+            continue
+        item["quantity_per_frame"] = 1
+        item["evidence"]["quantity_per_frame"] = [item["source_handle"], *edges]
+    for index, item in enumerate(items):
+        if index in invalid_totals or UNKNOWN in (item["quantity_per_frame"], item["frame_quantity"]):
+            continue
+        total = item["quantity_per_frame"] * item["frame_quantity"]
+        evidence = item["evidence"]
+        if item["quantity"] not in (UNKNOWN, total):
+            item["quantity"] = UNKNOWN
+            evidence.pop("quantity", None)
+            continue
+        item["quantity"] = total
+        evidence["quantity"] = list(dict.fromkeys([
+            *evidence.get("quantity", []), *evidence["quantity_per_frame"], *evidence["frame_quantity"],
+        ]))
+    return {
+        "items": items,
+        "frames": [
+            {**quantity, "evidence": list(frame.evidence)} for frame, quantity in assigned.items()
+        ],
+        "unassigned_quantities": unassigned,
+        "dxf_units": doc.units,
+    }
 
 
 def analyze_dxf(path):

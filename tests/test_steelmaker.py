@@ -112,3 +112,43 @@ def test_supplied_drawing():
         response = client.post("/analyze", files={"file": ("drawing.dxf", Path(filename).read_bytes())})
         assert response.status_code == 200
         assert response.json() == result
+
+
+def add_frame(doc, *, second_label=False):
+    model = doc.modelspace()
+    model.add_line((0, 0), (500, 0))
+    model.add_line((500, 0), (500, 400))
+    dim = model.add_linear_dim(base=(0, -30), p1=(0, 0), p2=(500, 0))
+    dim.render()
+    model.query("MTEXT")[-1].dxf.insert = (550, 200)
+    if second_label:
+        model.add_mtext("=2ea", dxfattribs={"insert": (560, 230)})
+
+
+@pytest.mark.parametrize("conflict", [False, True])
+def test_frame_count_links_only_unique_quantity_note(tmp_path, conflict):
+    doc, _ = native_drawing()
+    add_frame(doc, second_label=conflict)
+    result = analyze_dxf(save(doc, tmp_path))
+    item, = result["items"]
+    if conflict:
+        assert result["frames"] == []
+        assert len(result["unassigned_quantities"]) == 2
+        assert item["frame_quantity"] == item["quantity"] == UNKNOWN
+    else:
+        frame, = result["frames"]
+        assert frame["quantity"] == item["frame_quantity"] == item["quantity"] == 4
+        assert item["quantity_per_frame"] == 1
+        assert frame["source_handle"] in item["evidence"]["quantity"]
+        assert result["unassigned_quantities"] == []
+
+
+@pytest.mark.parametrize(("declared", "total"), [("", 8), ("\\P수량:7ea", UNKNOWN)])
+def test_frame_quantity_multiplies_explicit_parts_per_frame(tmp_path, declared, total):
+    doc, _ = native_drawing()
+    add_frame(doc)
+    doc.modelspace().query("MTEXT")[0].text = "절단\\P프레임당 수량:2ea" + declared
+    item, = analyze_dxf(save(doc, tmp_path))["items"]
+    assert item["frame_quantity"] == 4
+    assert item["quantity_per_frame"] == 2
+    assert item["quantity"] == total
